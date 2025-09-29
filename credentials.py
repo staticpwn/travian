@@ -1,8 +1,8 @@
 import os
 
-SERVER_URL = 'https://ts2.x1.international.travian.com//'
-LOGIN_USERNAME = "mohammad.wissam.farhoud@hotmail.com"
-LOGIN_PASSWORD = "wissam1massiw"
+SERVER_URL = 'https://ts3.travian.co.uk/'
+LOGIN_USERNAME = os.environ['LOGIN_USERNAME']
+LOGIN_PASSWORD = os.environ['LOGIN_PASSWORD']
 
 HEADERS = {
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
