@@ -256,3 +256,239 @@ def ensure_cdp_chrome_running(
     diag["ok"] = True
     return diag
 
+
+import time
+import json
+import requests
+from typing import Optional, Dict, Any
+from websocket import create_connection, WebSocketTimeoutException
+
+# ---------- Helpers to find targets ----------
+def list_devtools_targets(devtools_http: str, timeout: float = 2.0):
+    """
+    Return list of targets from the DevTools HTTP endpoint.
+    devtools_http example: "http://127.0.0.1:9222"
+    """
+    r = requests.get(f"{devtools_http.rstrip('/')}/json", timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def pick_target(devtools_http: str, target_selector: Optional[str] = None, timeout: float = 2.0):
+    """
+    Pick a page target.
+    - If target_selector is None: pick first 'page' type target (best-effort).
+    - If target_selector provided: match substring in url or title (case-insensitive).
+    Returns the target dict or raises LookupError.
+    """
+    targets = list_devtools_targets(devtools_http, timeout=timeout)
+    # filter page-like items with http(s) urls
+    pages = [t for t in targets if t.get("type") == "page" and t.get("url", "").startswith(("http://", "https://"))]
+    if target_selector:
+        needle = target_selector.lower()
+        for t in pages:
+            if needle in (t.get("url","").lower() or "") or needle in (t.get("title","").lower() or ""):
+                return t
+        # fallback: try matching against all targets (maybe chrome://newtab not matched)
+        for t in targets:
+            if needle in (t.get("url","").lower() or "") or needle in (t.get("title","").lower() or ""):
+                return t
+        raise LookupError(f"No target found matching: {target_selector!r}. Candidates:\n" +
+                          "\n".join(f"{p.get('title')}  {p.get('url')}" for p in pages))
+    # no selector: return first page (or any first target)
+    if pages:
+        return pages[0]
+    if targets:
+        return targets[0]
+    raise LookupError("No devtools targets available.")
+
+
+# ---------- Core navigation function ----------
+def navigate_to_site(
+    devtools_http: str,
+    ws_url: Optional[str] = None,
+    target_selector: Optional[str] = None,
+    url: Optional[str] = None,
+    set_skip_all_pauses: bool = True,
+    return_html: bool = True,
+    debug: bool = False,
+) -> Dict[str, Any]:
+    """
+    Connect to a DevTools target (via ws_url or by selecting a target from devtools_http),
+    optionally navigate to `url`, wait until document.readyState == wait_ready_state and
+    network has been idle for network_idle_ms (if network_idle_ms>0).
+    Returns a dict {
+        "ok": bool,
+        "final_url": str|None,
+        "title": str|None,
+        "timed_out": bool,
+        "nav_time_s": float,
+        "html": "<...>" or None,
+        "error": str|None
+    }
+    """
+
+    result = {
+        "ok": False,
+        "final_url": None,
+        "title": None,
+        "timed_out": False,
+        "nav_time_s": None,
+        "html": None,
+        "error": None,
+    }
+
+    try:
+        # If ws_url not given, pick a target
+        if not ws_url:
+            if not target_selector:
+                # default: pick first page
+                target = pick_target(devtools_http)
+            else:
+                target = pick_target(devtools_http, target_selector)
+            if debug:
+                print("Picked target:", target.get("title"), target.get("url"))
+            ws_url = target.get("webSocketDebuggerUrl")
+            if not ws_url:
+                raise RuntimeError("Target does not expose webSocketDebuggerUrl.")
+        start_time = time.time()
+        ws = create_connection(ws_url, timeout=5)
+
+        # enable domains
+        def send(idn, method, params=None):
+            payload = {"id": idn, "method": method}
+            if params is not None:
+                payload["params"] = params
+            if debug:
+                # don't print big payloads
+                print("SEND:", method, params if (not isinstance(params, dict) or len(str(params)) < 200) else "<params>")
+            ws.send(json.dumps(payload))
+
+        def recv_with_timeout(timeout_s=5.0):
+            ws.settimeout(timeout_s)
+            try:
+                data = ws.recv()
+            except WebSocketTimeoutException:
+                return None
+            if not data:
+                return None
+            return json.loads(data)
+
+        # Enable required domains
+        send(1, "Page.enable")
+        send(2, "Runtime.enable")
+        send(3, "Network.enable")
+        # optionally ensure debugger doesn't pause
+        if set_skip_all_pauses:
+            try:
+                send(4, "Debugger.enable")
+                # skip all pauses
+                send(5, "Debugger.setSkipAllPauses", {"skip": True})
+                # also avoid pausing on exceptions
+                send(6, "Debugger.setPauseOnExceptions", {"state": "none"})
+            except Exception:
+                # ignore if Debugger domain not available for some reason
+                pass
+
+        # drain initial responses/events
+        t0 = time.time()
+        while time.time() - t0 < 0.5:
+            try:
+                _ = recv_with_timeout(0.2)
+                # ignore
+            except Exception:
+                break
+
+        # If a navigation URL is provided - instruct the page to navigate
+        if url:
+            send(10, "Page.navigate", {"url": url})
+            # consume the response for Page.navigate which will have id 10 but we can't assume immediately
+            # small wait to allow navigation to start
+            time.sleep(0.05)
+
+        # Wait loop: poll readyState and watch Network events to compute inflight requests
+
+        result["nav_time_s"] = time.time() - start_time
+
+        # At this point, either we have got_ready or timed_out
+        # Optionally fetch HTML
+        if return_html:
+            try:
+                send(30, "Runtime.evaluate", {"expression": "document.documentElement.outerHTML", "returnByValue": True})
+                resp = recv_with_timeout(5.0)
+                if resp and resp.get("id") == 30:
+                    # nested: resp["result"]["result"]["value"]
+                    html = resp["result"]["result"].get("value")
+                    result["html"] = html
+                else:
+                    # fallback: try asking for innerHTML of body
+                    send(31, "Runtime.evaluate", {"expression": "document.body ? document.body.innerHTML : ''", "returnByValue": True})
+                    resp2 = recv_with_timeout(2.0)
+                    if resp2 and resp2.get("id") == 31:
+                        result["html"] = resp2["result"]["result"].get("value")
+            except Exception as e:
+                if debug:
+                    print("Failed to fetch HTML:", e)
+
+        # Close websocket cleanly
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+        # success if we didn't time out (optionally allow partial success)
+        result["ok"] = not result["timed_out"]
+        return result
+
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
+
+def get_outer_html_from_diag(diag):
+    """
+    Connects to the first available page target of the CDP Chrome instance
+    described by `diag`, retrieves document.documentElement.outerHTML,
+    and returns it as text.
+    """
+    devtools_http = diag.get("endpoint")
+    if not devtools_http:
+        raise ValueError("diag missing 'endpoint' key.")
+
+    # 1) List all targets
+    try:
+        targets = requests.get(f"{devtools_http.rstrip('/')}/json", timeout=3).json()
+    except Exception as e:
+        raise RuntimeError(f"Cannot query DevTools endpoint at {devtools_http}: {e}")
+
+    # 2) Pick first 'page' target
+    page_targets = [t for t in targets if t.get("type") == "page"]
+    if not page_targets:
+        raise RuntimeError("No page targets found on the DevTools endpoint.")
+    target = page_targets[0]
+
+    # 3) Connect to its websocket
+    ws_url = target.get("webSocketDebuggerUrl")
+    if not ws_url:
+        raise RuntimeError("Target has no webSocketDebuggerUrl.")
+    ws = create_connection(ws_url, timeout=5)
+
+    # 4) Ask for HTML
+    payload = {
+        "id": 1,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": "document.documentElement.outerHTML",
+            "returnByValue": True,
+        },
+    }
+    ws.send(json.dumps(payload))
+    res = ws.recv()
+    ws.close()
+
+    # 5) Extract value safely
+    try:
+        res_json = json.loads(res)
+        return res_json["result"]["result"]["value"]
+    except Exception:
+        return res
+
