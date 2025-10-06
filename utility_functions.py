@@ -7,12 +7,25 @@ import shutil
 import psutil
 import socket
 import subprocess
-from typing import Optional, Dict
+from typing import Optional, Dict, Any
+import requests
+from websocket import create_connection, WebSocketTimeoutException
+from pywinauto import Application, Desktop
+from wildcard import find_window
+import pyautogui as pa
+import random
+import pandas as pd
+from bs4 import BeautifulSoup
+import re
+import numpy as np
+from importlib import reload
 
-try:
-    import requests
-except ImportError:
-    raise SystemExit("Please: pip install requests psutil")
+import constants
+constants = reload(constants)
+from constants import *
+
+import warnings
+warnings.filterwarnings("ignore")
 
 # --- Optional: auto-find Chrome if path not provided (Windows/macOS/Linux) ---
 def find_chrome_executable() -> Optional[str]:
@@ -257,11 +270,7 @@ def ensure_cdp_chrome_running(
     return diag
 
 
-import time
-import json
-import requests
-from typing import Optional, Dict, Any
-from websocket import create_connection, WebSocketTimeoutException
+
 
 # ---------- Helpers to find targets ----------
 def list_devtools_targets(devtools_http: str, timeout: float = 2.0):
@@ -492,3 +501,300 @@ def get_outer_html_from_diag(diag):
     except Exception:
         return res
 
+def get_current_account():
+    for account in accounts:
+        if accounts[account]["current"]:
+            return account
+        
+def ensure_navigate(diag, target_url_label, label=True):
+    app = Application(backend="uia").connect(process=diag['pid'])
+    window = app.windows()[0]
+
+    pending_address_bar = window.descendants(control_type = "Edit")[0]
+
+    html = None
+    url = None
+
+    if label:
+        url = target_urls[target_url_label]
+    else:
+        url = target_url_label
+    
+    attempts = 0
+    while url.replace("https://", "").replace("www.", "") not in pending_address_bar.get_value():
+
+        html = navigate_to_site(diag['endpoint'],
+                                target_selector="",   # match url or title substring
+                                url=url,
+                                set_skip_all_pauses=True,  # set True if you want the page HTML returned
+                                debug=False)
+        
+        time.sleep(3)
+
+        attempts += 1
+
+        if attempts == 3:
+            current_account = get_current_account()
+            login_to_account(diag, current_account)
+            time.sleep(2)
+    
+    time.sleep(2)
+    
+    
+def fill_login_form(diag, account_username, account_password):
+
+    app = Application(backend="uia").connect(process=diag['pid'])
+    window = app.windows()[0]
+
+    login_buttons = window.descendants(control_type = "Button", title="Login")
+
+    while len(login_buttons) == 0:
+        time.sleep(2)
+        login_buttons = window.descendants(control_type = "Button", title="Login")
+
+    address_bar, username_wrapper, password_wrapper = window.descendants(control_type = "Edit")
+
+    
+    login_button = None
+    if len(login_buttons) > 1:
+        
+        login_button = window.descendants(control_type = "Button", title="Login")[1]
+        
+    else:
+
+        login_button = window.descendants(control_type = "Button", title="Login")[0]
+        
+    move_to_rectangle(username_wrapper, tween_functions)
+    username_wrapper.set_edit_text(account_username)
+    move_to_rectangle(password_wrapper, tween_functions)
+    password_wrapper.set_edit_text(account_password)
+    move_to_rectangle(login_button, tween_functions)
+    login_button.click_input()
+
+def enter_world(diag):
+
+    app = Application(backend="uia").connect(process=diag['pid'])
+    window = app.windows()[0]
+    
+    while len(window.descendants(control_type = "Button", title="PLAY NOW")) == 0:
+        time.sleep(0.5)
+        pass
+
+    play_now_button = window.descendants(control_type = "Button", title="PLAY NOW")[0]
+    move_to_rectangle(play_now_button, tween_functions)
+    play_now_button.click_input()
+
+
+def login(diag, account_username, account_password):
+
+  
+    ensure_navigate(diag, "login")
+
+    fill_login_form(diag, account_username, account_password)
+
+    enter_world(diag)
+
+
+def login_to_account(diag, account_name):
+    account = accounts[account_name]
+
+    account_email = account["email"]
+    account_password = account["password"] 
+
+    login(diag, account_email, account_password)  
+
+    ensure_navigate(diag, "terana_village")
+
+    current_account = get_current_account()
+    accounts[current_account]["current"] = False
+    accounts[account_name]["current"] = True
+
+    print(f"logged in to {account_name}")
+
+
+def move_to_rectangle(wrapper, tween_functions):
+    rectangle = wrapper.rectangle()
+    mid_point = rectangle.mid_point()
+
+    random.seed(int(time.time()))
+    num = random.randint(0, len(tween_functions)-1)
+    duration = random.uniform(1,4)
+    
+    pa.moveTo(mid_point.x, mid_point.y, duration=duration, tween=tween_functions[num])
+
+
+
+def analyze_overview_page(html):
+    troops_numbers_and_limits = {
+        'TTT': {'number':4, 'limit':3},
+    }
+
+    overview_page_parser = BeautifulSoup(html, 'html.parser')
+
+    available_troops = {}
+
+    for unit in troops_numbers_and_limits:
+        target_link = overview_page_parser.find('a', onclick=lambda x: x and f"troop[t{troops_numbers_and_limits[unit]['number']}]" in x)
+
+        if target_link:
+            # Get text and clean directional formatting characters
+            raw_text = target_link.get_text()
+            # Strip Unicode BiDi formatting (U+202D, U+202C, etc.)
+            cleaned_text = raw_text.strip('\u202c\u202d\u200e\u200f')  # Common directional marks
+            # Or use: cleaned_text = re.sub(r'[\u202a-\u202e]', '', raw_text)
+            
+
+            available_of_this_unit = int(cleaned_text)
+            
+            if available_of_this_unit >= troops_numbers_and_limits[unit]['limit']:
+                available_troops[troops_numbers_and_limits[unit]['number']] = available_of_this_unit   
+    
+    return available_troops
+
+
+
+
+def clean_unicode(s):
+    """Remove Unicode directional and formatting characters."""
+    s = re.sub(r'[\u202A-\u202E\u200F\u200E]', '', s)  # LRO, RLO, PDF, etc.
+    s = re.sub(r'\s+', ' ', s)  # Normalize whitespace
+    s = s.replace('\u2212', '-')
+    return s.strip()
+
+def parse_tile_details(html):
+    soup = BeautifulSoup(html, 'html.parser')
+    data = {}
+
+    # --- 1. Coordinates ---
+    try:
+        x_text = clean_unicode(soup.find('span', class_='coordinateX').get_text(strip=True))
+
+        y_text = clean_unicode(soup.find('span', class_='coordinateY').get_text(strip=True))
+
+        x_match = re.search(r'-?\d+', x_text)
+        y_match = re.search(r'-?\d+', y_text)
+        
+        x = int(x_match.group())
+        y = int(y_match.group())
+
+        data["index"] = f"tile_{x}_{y}"
+        data['coordinates'] = (x, y)
+    except Exception as e:
+        data['coordinates'] = None
+        print("Error parsing coordinates:", e)
+
+    # --- 2. Type (e.g., "Unoccupied oasis" or "YPRKL's village") ---
+    try:
+        title_tag = soup.find('h1', class_='titleInHeader')
+        raw_text = title_tag.get_text(strip=True)
+        cleaned_text = clean_unicode(raw_text)
+        
+        # Remove coordinates part (anything starting with a digit or parenthesis)
+        type_text = re.split(r'[\d\(]', cleaned_text)[0].strip()
+
+        if "village" in type_text:
+            owner = type_text.replace("'s village", "")
+            type_text = "village"
+        else:
+            owner = "nature"
+
+        data['type'] = type_text or "Unknown"
+        data['owner'] = owner
+        
+    except Exception as e:
+        data['type'] = 'Unknown'
+        print("Error parsing type:", e)
+
+    # --- 3. Troops ---
+    troops = []
+    try:
+        # Look for troop table with class 'transparent' and unit images
+        troop_table = soup.find('table', id='troop_info', class_='transparent')
+        if troop_table:
+            for row in troop_table.find_all('tr'):
+                img = row.find('img', class_='unit')
+                val_td = row.find('td', class_='val')
+                desc_td = row.find('td', class_='desc')
+                if img and val_td and desc_td:
+                    unit_name = img.get('alt')
+                    count = int(val_td.get_text(strip=True))
+                    troops.append({'unit': unit_name, 'count': count})
+    except Exception as e:
+        print("Error parsing troops:", e)
+    
+    data['troops'] = troops if troops else None  # Explicitly set to None if no troops
+
+    # --- 4. Distance ---
+    try:
+        # Check both possible locations:
+        # 1. Standalone distance table
+        dist_table = soup.find('table', id='distance')
+        if dist_table:
+            dist_td = dist_table.find('td', class_='bold')
+            if dist_td:
+                data['distance'] = float(clean_unicode(dist_td.get_text(strip=True)).split(" ")[0])
+            else:
+                data['distance'] = None
+        else:
+            # 2. In village_info table, under "Distance" row
+            village_info = soup.find('table', id='village_info')
+            if village_info:
+                for row in village_info.find_all('tr'):
+                    th = row.find('th')
+                    if th and 'distance' in th.get_text(strip=True).lower():
+                        td = row.find('td')
+                        if td:
+                            data['distance'] = float(clean_unicode(td.get_text(strip=True)).split(" ")[0])
+                        break
+                else:
+                    data['distance'] = None
+            else:
+                data['distance'] = None
+    except Exception as e:
+        data['distance'] = None
+        print("Error parsing distance:", e)
+
+    # --- 5. Extra: Owner, Tribe, Alliance, Population (for villages) ---
+    try:
+        info_table = soup.find('table', id='village_info')
+        if info_table:
+            extras = {}
+            for row in info_table.find_all('tr'):
+                th = row.find('th')
+                td = row.find('td')
+                if th and td:
+                    key = clean_unicode(th.get_text()).lower().replace(' ', '_')
+                    value = clean_unicode(td.get_text())
+                    if key in ["distance", "population"]:
+                        value = float(clean_unicode(td.get_text()).split(" ")[0])
+                    extras[key] = value
+            data.update(extras)
+    except Exception as e:
+        print("Error parsing village info:", e)
+
+    try:
+        # Look for the "Bonus" table
+        bonus_table = soup.find('table', id='distribution')
+
+        resources = []
+        for row in bonus_table.find_all('tr'):
+            # Get the resource icon (has class like r1, r2, etc. and title)
+            icon = row.find('i', class_=re.compile(r'^r\d+$'))
+            desc_td = row.find('td', class_='desc')
+            
+            if icon and desc_td:
+                resource_name = clean_unicode(icon.get('title') or desc_td.get_text())
+                bonus_text = clean_unicode(row.find('td', class_='val').get_text())
+                
+                # Extract percentage
+                perc = re.search(r'(\d+)%', bonus_text)
+                percentage = int(perc.group(1)) if perc else None
+                
+                resources.append(resource_name)
+            
+            data['resources'] = ",".join(resources)
+
+    except Exception as e:
+        pass
+
+    return data
