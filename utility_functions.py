@@ -270,7 +270,30 @@ def ensure_cdp_chrome_running(
     return diag
 
 
+_cdp_msg_id = 1000
+def _cdp_call(ws, method, params=None, timeout=6.0):
+    """Send a CDP command and return the response that has the same 'id'."""
+    global _cdp_msg_id
+    _cdp_msg_id += 1
+    msg_id = _cdp_msg_id
+    ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
 
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ws.settimeout(max(0.05, deadline - time.time()))
+        try:
+            raw = ws.recv()
+        except WebSocketTimeoutException:
+            break
+        if not raw:
+            continue
+        data = json.loads(raw)
+        # ignore async events (no 'id'); return only our matching response
+        if data.get("id") == msg_id:
+            if "error" in data:
+                raise RuntimeError(f"CDP error for {method}: {data['error']}")
+            return data
+    raise TimeoutError(f"Timed out waiting for response to {method}")
 
 # ---------- Helpers to find targets ----------
 def list_devtools_targets(devtools_http: str, timeout: float = 2.0):
@@ -798,3 +821,74 @@ def parse_tile_details(html):
         pass
 
     return data
+
+
+import json
+import requests
+from typing import Dict, Optional
+from websocket import create_connection
+
+# --- minimal CDP call helper (waits for matching id) ---
+# _msg_id = 3000
+# def _cdp_call(ws, method: str, params: Optional[dict] = None, timeout: float = 6.0):
+#     global _msg_id
+#     _msg_id += 1
+#     req = {"id": _msg_id, "method": method, "params": params or {}}
+#     ws.send(json.dumps(req))
+#     ws.settimeout(timeout)
+#     while True:
+#         resp = json.loads(ws.recv())
+#         if resp.get("id") == _msg_id:
+#             if "error" in resp:
+#                 raise RuntimeError(f"CDP error for {method}: {resp['error']}")
+#             return resp
+
+# --- helpers to get the BROWSER websocket and list page targets ---
+def _get_browser_ws_url(endpoint_http: str) -> str:
+    """Return ws://... for the *browser* target (from /json/version)."""
+    info = requests.get(endpoint_http.rstrip("/") + "/json/version", timeout=4).json()
+    ws_url = info.get("webSocketDebuggerUrl")
+    if not ws_url:
+        raise RuntimeError("Browser webSocketDebuggerUrl not found (is Chrome running with --remote-debugging-port?)")
+    return ws_url
+
+def list_page_targets(diag: Dict) -> list[Dict]:
+    """List all 'page' targets (tabs)."""
+    endpoint = diag["endpoint"].rstrip("/")
+    targets = requests.get(endpoint + "/json", timeout=4).json()
+    return [t for t in targets if t.get("type") == "page"]
+
+# --- 1) Open a new tab (robust) ---
+def open_new_tab(diag: Dict, url: str = "about:blank") -> Dict:
+    """
+    Open a new tab using Target.createTarget via the browser websocket.
+    Returns the TargetInfo dict: includes 'targetId', 'type', 'title', 'url'.
+    """
+    browser_ws = create_connection(_get_browser_ws_url(diag["endpoint"]), timeout=8)
+    try:
+        resp = _cdp_call(browser_ws, "Target.createTarget", {"url": url})
+        # resp['result'] => {'targetId': '...'}
+        target_id = resp["result"]["targetId"]
+        # Optionally fetch full info:
+        info = _cdp_call(browser_ws, "Target.getTargets")["result"]["targetInfos"]
+        ti = next(t for t in info if t["targetId"] == target_id)
+        return ti
+    finally:
+        browser_ws.close()
+
+# --- 2) Activate (focus) a tab by targetId ---
+def activate_tab(diag: Dict, target_id: str) -> None:
+    """
+    Bring the given targetId (tab) to the foreground using Target.activateTarget.
+    """
+    browser_ws = create_connection(_get_browser_ws_url(diag["endpoint"]), timeout=8)
+    try:
+        _cdp_call(browser_ws, "Target.activateTarget", {"targetId": target_id})
+    finally:
+        browser_ws.close()
+
+
+
+# PID = os.getpid()
+
+# subprocess.Popen(os.path.join(os.getcwd(), f"watcher.exe {str(PID)}").replace("\\", "/"), creationflags=subprocess.CREATE_NEW_CONSOLE)
