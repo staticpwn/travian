@@ -1,4 +1,6 @@
 import pyautogui as pa
+from datetime import datetime
+from datetime import time as dtime
 
 tween_functions = [
     pa.linear,         # constant speed
@@ -44,6 +46,11 @@ accounts = {
         "email": "farhoud.solutions@gmail.com",
         "password": "aboodf2000",
         "current": False,
+    },
+    "el_hammar": {
+        "email": "masterking11@gmail.com",
+        "password": "Staticpwn",
+        "current": False,
     }
 }
 
@@ -56,5 +63,15 @@ target_urls = {
 }
 
 TTT_BOX_NUMBER = 1
-TTT_RAID_COUNT = 5
-RAIDING_RADIUS_FROM_TERANA = 35
+TTT_RAID_COUNT = 3
+RAIDING_RADIUS_FROM_TERANA = 30
+
+village_coords = {
+    "terana": (70, -2),
+}
+
+period_allocations = {
+    "NobelSword": (dtime(5, 30), dtime(13, 0)),
+    "daggerman": (dtime(14, 0), dtime(17, 0)),
+    "el_hammar": (dtime(18, 0), dtime(4, 30)),
+}
