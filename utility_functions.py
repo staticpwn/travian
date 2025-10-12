@@ -7,7 +7,7 @@ import shutil
 import psutil
 import socket
 import subprocess
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import requests
 from websocket import create_connection, WebSocketTimeoutException
 from pywinauto import Application, Desktop
@@ -19,6 +19,9 @@ from bs4 import BeautifulSoup
 import re
 import numpy as np
 from importlib import reload
+import math
+import platform
+
 
 import constants
 constants = reload(constants)
@@ -218,6 +221,10 @@ def ensure_cdp_chrome_running(
         f"--remote-allow-origins=http://127.0.0.1:{remote_port}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-session-crashed-bubble",
+        "--hide-crash-restore-bubble",
+        "--disable-infobars",
+        "--start-maximized",
         # keep it visible; do NOT reuse regular profile
     ]
     if extra_args:
@@ -270,30 +277,7 @@ def ensure_cdp_chrome_running(
     return diag
 
 
-_cdp_msg_id = 1000
-def _cdp_call(ws, method, params=None, timeout=6.0):
-    """Send a CDP command and return the response that has the same 'id'."""
-    global _cdp_msg_id
-    _cdp_msg_id += 1
-    msg_id = _cdp_msg_id
-    ws.send(json.dumps({"id": msg_id, "method": method, "params": params or {}}))
 
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        ws.settimeout(max(0.05, deadline - time.time()))
-        try:
-            raw = ws.recv()
-        except WebSocketTimeoutException:
-            break
-        if not raw:
-            continue
-        data = json.loads(raw)
-        # ignore async events (no 'id'); return only our matching response
-        if data.get("id") == msg_id:
-            if "error" in data:
-                raise RuntimeError(f"CDP error for {method}: {data['error']}")
-            return data
-    raise TimeoutError(f"Timed out waiting for response to {method}")
 
 # ---------- Helpers to find targets ----------
 def list_devtools_targets(devtools_http: str, timeout: float = 2.0):
@@ -384,7 +368,7 @@ def navigate_to_site(
             if not ws_url:
                 raise RuntimeError("Target does not expose webSocketDebuggerUrl.")
         start_time = time.time()
-        ws = create_connection(ws_url, timeout=5)
+        ws = create_connection(ws_url, timeout=50)
 
         # enable domains
         def send(idn, method, params=None):
@@ -488,7 +472,7 @@ def get_outer_html_from_diag(diag):
 
     # 1) List all targets
     try:
-        targets = requests.get(f"{devtools_http.rstrip('/')}/json", timeout=3).json()
+        targets = requests.get(f"{devtools_http.rstrip('/')}/json", timeout=30).json()
     except Exception as e:
         raise RuntimeError(f"Cannot query DevTools endpoint at {devtools_http}: {e}")
 
@@ -502,7 +486,7 @@ def get_outer_html_from_diag(diag):
     ws_url = target.get("webSocketDebuggerUrl")
     if not ws_url:
         raise RuntimeError("Target has no webSocketDebuggerUrl.")
-    ws = create_connection(ws_url, timeout=5)
+    ws = create_connection(ws_url, timeout=50)
 
     # 4) Ask for HTML
     payload = {
@@ -559,9 +543,9 @@ def ensure_navigate(diag, target_url_label, label=True):
         if attempts == 3:
             current_account = get_current_account()
             login_to_account(diag, current_account)
-            time.sleep(2)
+            time.sleep(1)
     
-    time.sleep(2)
+    time.sleep(1)
     
     
 def fill_login_form(diag, account_username, account_password):
@@ -641,9 +625,9 @@ def move_to_rectangle(wrapper, tween_functions):
 
     random.seed(int(time.time()))
     num = random.randint(0, len(tween_functions)-1)
-    duration = random.uniform(1,4)
+    duration = random.uniform(0.1,1)
     
-    pa.moveTo(mid_point.x, mid_point.y, duration=duration, tween=tween_functions[num])
+    pa.moveTo(mid_point.x + random.randint(-18,18), mid_point.y + random.randint(-5,5), duration=duration, tween=tween_functions[num])
 
 
 
@@ -823,72 +807,153 @@ def parse_tile_details(html):
     return data
 
 
-import json
-import requests
-from typing import Dict, Optional
-from websocket import create_connection
 
-# --- minimal CDP call helper (waits for matching id) ---
-# _msg_id = 3000
-# def _cdp_call(ws, method: str, params: Optional[dict] = None, timeout: float = 6.0):
-#     global _msg_id
-#     _msg_id += 1
-#     req = {"id": _msg_id, "method": method, "params": params or {}}
-#     ws.send(json.dumps(req))
-#     ws.settimeout(timeout)
-#     while True:
-#         resp = json.loads(ws.recv())
-#         if resp.get("id") == _msg_id:
-#             if "error" in resp:
-#                 raise RuntimeError(f"CDP error for {method}: {resp['error']}")
-#             return resp
-
-# --- helpers to get the BROWSER websocket and list page targets ---
-def _get_browser_ws_url(endpoint_http: str) -> str:
-    """Return ws://... for the *browser* target (from /json/version)."""
-    info = requests.get(endpoint_http.rstrip("/") + "/json/version", timeout=4).json()
-    ws_url = info.get("webSocketDebuggerUrl")
-    if not ws_url:
-        raise RuntimeError("Browser webSocketDebuggerUrl not found (is Chrome running with --remote-debugging-port?)")
-    return ws_url
-
-def list_page_targets(diag: Dict) -> list[Dict]:
-    """List all 'page' targets (tabs)."""
-    endpoint = diag["endpoint"].rstrip("/")
-    targets = requests.get(endpoint + "/json", timeout=4).json()
-    return [t for t in targets if t.get("type") == "page"]
-
-# --- 1) Open a new tab (robust) ---
-def open_new_tab(diag: Dict, url: str = "about:blank") -> Dict:
+def distance_between_points(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
     """
-    Open a new tab using Target.createTarget via the browser websocket.
-    Returns the TargetInfo dict: includes 'targetId', 'type', 'title', 'url'.
+    Return the straight-line (Euclidean) distance between two coordinate points.
+
+    Args:
+        p1: (x1, y1)
+        p2: (x2, y2)
+
+    Returns:
+        float: direct distance
     """
-    browser_ws = create_connection(_get_browser_ws_url(diag["endpoint"]), timeout=8)
+    return round(math.hypot(p2[0] - p1[0], p2[1] - p1[1]), 1)
+
+
+def get_tile_info_html_from_diag(diag, x, y):
+    
+    tile_url = target_urls['tile_base'] + f"x={x}&y={y}"
+    
+    ensure_navigate(diag, tile_url, label=False)
+    tile_html = get_outer_html_from_diag(diag)
+
+    return tile_html
+
+def send_oasis_raid(diag):
+
+    ### this function expects the oasis tile pane to be open at function call
+    app = Application(backend="uia").connect(process=diag['pid'])
+    window = app.windows()[0]
+
+    raid_link = window.descendants(control_type="Hyperlink", title="Raid unoccupied oasis")[0]
+    move_to_rectangle(raid_link, tween_functions)
+    raid_link.click_input()
+
+    while len(window.descendants(control_type="Button", title="Send")) == 0:
+        time.sleep(0.1)
+        pass
+
+    overview_page_html = get_outer_html_from_diag(diag)
+    troops = analyze_overview_page(overview_page_html)
+
+    if len(troops) == 0:
+        return False
+
+    send_button = window.descendants(control_type="Button", title="Send")[0]
+    time.sleep(0.5)
+
+    ttt_box_wrapper = window.descendants(control_type="Edit")[1:-1][TTT_BOX_NUMBER]
+    move_to_rectangle(ttt_box_wrapper, tween_functions)
+    ttt_box_wrapper.click_input()
+    ttt_box_wrapper.set_edit_text(str(TTT_RAID_COUNT))
+
+    move_to_rectangle(send_button, tween_functions)
+    send_button.click_input()
+
+    while len(window.descendants(control_type="Button", title="Confirm")) == 0:
+        time.sleep(0.1)
+        pass
+    
+    confirm_button = window.descendants(control_type="Button", title="Confirm")[0]
+    time.sleep(0.1)
+
+    move_to_rectangle(confirm_button, tween_functions)
+    confirm_button.click_input()
+
+    time.sleep(1)
+
+    return True
+
+
+
+
+def get_user_for_period(periods: dict) -> str | None:
+    """
+    Return the username whose period covers the current time.
+    Handles both normal and cross-midnight intervals.
+    Returns None if no period matches.
+    """
+    now = datetime.now().time()
+
+    for user, (start, end) in periods.items():
+        if start <= end:
+            # normal range, e.g. 07:00–13:30
+            if start <= now <= end:
+                return user
+        else:
+            # crosses midnight, e.g. 22:00–04:30
+            if now >= start or now <= end:
+                return user
+
+    return None
+
+
+def kill_all_chrome() -> int:
+    """
+    Force-kill all Chrome/Chromium windows (and chromedriver) on the current OS.
+    Returns the count of successful kill commands.
+    """
+    system = platform.system()
+    cmds = []
+
+    if system == "Windows":
+        cmds = [
+            ["taskkill", "/F", "/IM", "chrome.exe", "/T"],
+            ["taskkill", "/F", "/IM", "chrome_proxy.exe", "/T"],
+            ["taskkill", "/F", "/IM", "chrome_crashpad_handler.exe", "/T"],
+            ["taskkill", "/F", "/IM", "chromedriver.exe", "/T"],
+        ]
+    elif system == "Darwin":  # macOS
+        cmds = [
+            ["pkill", "-f", "Google Chrome"],
+            ["pkill", "-f", "Chromium"],
+            ["pkill", "-f", "chromedriver"],
+        ]
+    else:  # Linux/others
+        cmds = [
+            ["pkill", "-f", "chrome"],
+            ["pkill", "-f", "chromium"],
+            ["pkill", "-f", "chromedriver"],
+        ]
+
+    ok = 0
+    for c in cmds:
+        try:
+            # run quietly; consider non-zero (no process) as not fatal
+            subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            ok += 1
+        except Exception:
+            pass
+    return ok
+
+def kill_cdp_chrome(previous_pid):
+    """Kill the Chrome process you launched (and its children)."""
     try:
-        resp = _cdp_call(browser_ws, "Target.createTarget", {"url": url})
-        # resp['result'] => {'targetId': '...'}
-        target_id = resp["result"]["targetId"]
-        # Optionally fetch full info:
-        info = _cdp_call(browser_ws, "Target.getTargets")["result"]["targetInfos"]
-        ti = next(t for t in info if t["targetId"] == target_id)
-        return ti
-    finally:
-        browser_ws.close()
-
-# --- 2) Activate (focus) a tab by targetId ---
-def activate_tab(diag: Dict, target_id: str) -> None:
-    """
-    Bring the given targetId (tab) to the foreground using Target.activateTarget.
-    """
-    browser_ws = create_connection(_get_browser_ws_url(diag["endpoint"]), timeout=8)
+        parent = psutil.Process(int(previous_pid))
+    except psutil.NoSuchProcess:
+        return 0
+    count = 0
+    for child in parent.children(recursive=True):
+        try:
+            child.kill()
+            count += 1
+        except Exception:
+            pass
     try:
-        _cdp_call(browser_ws, "Target.activateTarget", {"targetId": target_id})
-    finally:
-        browser_ws.close()
-
-
-
-# PID = os.getpid()
-
-# subprocess.Popen(os.path.join(os.getcwd(), f"watcher.exe {str(PID)}").replace("\\", "/"), creationflags=subprocess.CREATE_NEW_CONSOLE)
+        parent.kill()
+        count += 1
+    except Exception:
+        pass
+    return count
